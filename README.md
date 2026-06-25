@@ -86,6 +86,7 @@ export MCP_TRANSPORT=http
 export HOST=127.0.0.1
 export PORT=3333
 export MCP_BEARER_TOKEN="een-lange-random-secret"
+export MCP_CONNECT_CODE="een-code-die-je-in-chatgpt-kunt-typen"
 npm run start:http
 ```
 
@@ -115,6 +116,7 @@ Railway is de aanbevolen route voor dit project, omdat deze server als normale l
 TRELLO_API_KEY=jouw-api-key
 TRELLO_TOKEN=jouw-token
 MCP_BEARER_TOKEN=een-lange-random-secret
+MCP_CONNECT_CODE=een-code-die-je-in-chatgpt-kunt-typen
 ```
 
 4. Deploy. Railway gebruikt `railway.json` om de server in HTTP-modus te starten.
@@ -125,7 +127,7 @@ MCP_BEARER_TOKEN=een-lange-random-secret
 https://jouw-service.up.railway.app/mcp
 ```
 
-Gebruik de bearer token als authenticatie wanneer je ChatGPT connector/app-configuratie dat ondersteunt.
+Voor ChatGPT Custom Apps gebruikt de server OAuth. Tijdens het koppelen opent ChatGPT een autorisatiepagina. Vul daar `MCP_CONNECT_CODE` in. Als je `MCP_CONNECT_CODE` niet hebt gezet, gebruik dan `MCP_BEARER_TOKEN`.
 
 ## Netlify?
 

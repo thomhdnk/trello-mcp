@@ -2,6 +2,7 @@
 
 import http from "node:http";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import { URL } from "node:url";
 
 const SERVER_NAME = "trello-mcp-server";
@@ -22,6 +23,9 @@ const jsonSchema = (properties, required = []) => ({
 const stringProp = (description) => ({ type: "string", description });
 const boolProp = (description) => ({ type: "boolean", description });
 const numberProp = (description) => ({ type: "number", description });
+const oauthClients = new Map();
+const oauthCodes = new Map();
+const oauthTokens = new Map();
 
 function loadDotEnv() {
   if (!fs.existsSync(".env")) return;
@@ -38,6 +42,77 @@ function loadDotEnv() {
 }
 
 loadDotEnv();
+
+function randomToken(prefix) {
+  return `${prefix}_${crypto.randomBytes(24).toString("base64url")}`;
+}
+
+function baseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] ?? "http";
+  const host = req.headers["x-forwarded-host"] ?? req.headers.host ?? "localhost";
+  return `${proto}://${host}`;
+}
+
+function sendJson(res, status, payload, headers = {}) {
+  res.writeHead(status, { "content-type": "application/json", ...headers });
+  res.end(JSON.stringify(payload));
+}
+
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+async function parseBodyText(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function parseFormBody(req) {
+  const body = await parseBodyText(req);
+  return Object.fromEntries(new URLSearchParams(body));
+}
+
+function pkceChallenge(verifier) {
+  return crypto.createHash("sha256").update(verifier).digest("base64url");
+}
+
+function pkceMatches(code, verifier) {
+  if (!code.code_challenge) return true;
+  if (code.code_challenge_method === "S256") {
+    return pkceChallenge(verifier) === code.code_challenge;
+  }
+  return verifier === code.code_challenge;
+}
+
+function protectedResourceMetadata(req) {
+  const root = baseUrl(req);
+  return {
+    resource: `${root}/mcp`,
+    authorization_servers: [root],
+    bearer_methods_supported: ["header"],
+    resource_name: "Trello MCP Server"
+  };
+}
+
+function authorizationServerMetadata(req) {
+  const root = baseUrl(req);
+  return {
+    issuer: root,
+    authorization_endpoint: `${root}/authorize`,
+    token_endpoint: `${root}/token`,
+    registration_endpoint: `${root}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code", "refresh_token"],
+    code_challenge_methods_supported: ["S256", "plain"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: ["trello"]
+  };
+}
 
 const tools = [
   {
@@ -449,16 +524,192 @@ function startStdio() {
 }
 
 async function parseJsonBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const body = Buffer.concat(chunks).toString("utf8");
+  const body = await parseBodyText(req);
   return body ? JSON.parse(body) : {};
 }
 
 function isAuthorized(req) {
   const expected = process.env.MCP_BEARER_TOKEN;
-  if (!expected) return true;
-  return req.headers.authorization === `Bearer ${expected}`;
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith("Bearer ")) return !expected;
+  const token = auth.slice("Bearer ".length);
+  if (expected && token === expected) return true;
+  const issued = oauthTokens.get(token);
+  return Boolean(issued && issued.expires_at > Date.now());
+}
+
+function unauthorized(req, res) {
+  const metadataUrl = `${baseUrl(req)}/.well-known/oauth-protected-resource`;
+  res.writeHead(401, {
+    "content-type": "application/json",
+    "www-authenticate": `Bearer resource_metadata="${metadataUrl}"`
+  });
+  res.end(JSON.stringify({ error: "Unauthorized" }));
+}
+
+async function handleRegister(req, res) {
+  const body = await parseJsonBody(req);
+  const clientId = randomToken("client");
+  const client = {
+    client_id: clientId,
+    client_name: body.client_name ?? "ChatGPT",
+    redirect_uris: Array.isArray(body.redirect_uris) ? body.redirect_uris : [],
+    grant_types: body.grant_types ?? ["authorization_code", "refresh_token"],
+    response_types: body.response_types ?? ["code"],
+    token_endpoint_auth_method: "none",
+    scope: body.scope ?? "trello",
+    created_at: Date.now()
+  };
+  oauthClients.set(clientId, client);
+  sendJson(res, 201, client);
+}
+
+function handleAuthorizeGet(req, res, url) {
+  const client = oauthClients.get(url.searchParams.get("client_id"));
+  const redirectUri = url.searchParams.get("redirect_uri");
+  if (!client || !redirectUri || !client.redirect_uris.includes(redirectUri)) {
+    sendJson(res, 400, { error: "invalid_client_or_redirect_uri" });
+    return;
+  }
+
+  const page = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize Trello MCP</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f6f7f9; color: #172b4d; }
+    main { max-width: 420px; margin: 12vh auto; background: #fff; border: 1px solid #dfe1e6; border-radius: 8px; padding: 24px; }
+    h1 { font-size: 22px; margin: 0 0 12px; }
+    p { line-height: 1.45; }
+    label { display: block; font-weight: 600; margin: 18px 0 6px; }
+    input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #c1c7d0; border-radius: 6px; font-size: 16px; }
+    button { margin-top: 18px; width: 100%; padding: 11px 14px; border: 0; border-radius: 6px; background: #0c66e4; color: white; font-weight: 700; font-size: 16px; }
+    small { display: block; color: #626f86; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Authorize Trello MCP</h1>
+    <p>Allow ${htmlEscape(client.client_name)} to connect to this Trello MCP server.</p>
+    <form method="post" action="/authorize">
+      ${[...url.searchParams.entries()].map(([key, value]) => `<input type="hidden" name="${htmlEscape(key)}" value="${htmlEscape(value)}">`).join("")}
+      <label for="connect_code">Connect code</label>
+      <input id="connect_code" name="connect_code" type="password" autocomplete="one-time-code" autofocus required>
+      <button type="submit">Authorize</button>
+      <small>Use your Railway MCP_BEARER_TOKEN, unless MCP_CONNECT_CODE is set.</small>
+    </form>
+  </main>
+</body>
+</html>`;
+
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(page);
+}
+
+async function handleAuthorizePost(req, res) {
+  const form = await parseFormBody(req);
+  const expectedCode = process.env.MCP_CONNECT_CODE ?? process.env.MCP_BEARER_TOKEN;
+  if (expectedCode && form.connect_code !== expectedCode) {
+    sendJson(res, 403, { error: "invalid_connect_code" });
+    return;
+  }
+
+  const client = oauthClients.get(form.client_id);
+  if (!client || !client.redirect_uris.includes(form.redirect_uri)) {
+    sendJson(res, 400, { error: "invalid_client_or_redirect_uri" });
+    return;
+  }
+
+  const code = randomToken("code");
+  oauthCodes.set(code, {
+    client_id: form.client_id,
+    redirect_uri: form.redirect_uri,
+    code_challenge: form.code_challenge,
+    code_challenge_method: form.code_challenge_method ?? "plain",
+    resource: form.resource,
+    scope: form.scope ?? "trello",
+    expires_at: Date.now() + 5 * 60 * 1000
+  });
+
+  const redirect = new URL(form.redirect_uri);
+  redirect.searchParams.set("code", code);
+  if (form.state) redirect.searchParams.set("state", form.state);
+  res.writeHead(302, { location: redirect.toString() });
+  res.end();
+}
+
+async function handleToken(req, res) {
+  const form = await parseFormBody(req);
+
+  if (form.grant_type === "authorization_code") {
+    const code = oauthCodes.get(form.code);
+    oauthCodes.delete(form.code);
+
+    if (!code || code.expires_at <= Date.now()) {
+      sendJson(res, 400, { error: "invalid_grant" });
+      return;
+    }
+    if (code.client_id !== form.client_id || code.redirect_uri !== form.redirect_uri) {
+      sendJson(res, 400, { error: "invalid_grant" });
+      return;
+    }
+    if (!pkceMatches(code, form.code_verifier)) {
+      sendJson(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
+      return;
+    }
+
+    const accessToken = randomToken("mcp");
+    const refreshToken = randomToken("refresh");
+    oauthTokens.set(accessToken, {
+      client_id: form.client_id,
+      scope: code.scope,
+      resource: form.resource ?? code.resource,
+      expires_at: Date.now() + 60 * 60 * 1000
+    });
+    oauthTokens.set(refreshToken, {
+      client_id: form.client_id,
+      scope: code.scope,
+      resource: form.resource ?? code.resource,
+      expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      refresh: true
+    });
+
+    sendJson(res, 200, {
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: 3600,
+      refresh_token: refreshToken,
+      scope: code.scope
+    }, { "cache-control": "no-store" });
+    return;
+  }
+
+  if (form.grant_type === "refresh_token") {
+    const refresh = oauthTokens.get(form.refresh_token);
+    if (!refresh?.refresh || refresh.expires_at <= Date.now()) {
+      sendJson(res, 400, { error: "invalid_grant" });
+      return;
+    }
+
+    const accessToken = randomToken("mcp");
+    oauthTokens.set(accessToken, {
+      client_id: refresh.client_id,
+      scope: refresh.scope,
+      resource: form.resource ?? refresh.resource,
+      expires_at: Date.now() + 60 * 60 * 1000
+    });
+    sendJson(res, 200, {
+      access_token: accessToken,
+      token_type: "Bearer",
+      expires_in: 3600,
+      scope: refresh.scope
+    }, { "cache-control": "no-store" });
+    return;
+  }
+
+  sendJson(res, 400, { error: "unsupported_grant_type" });
 }
 
 function startHttp() {
@@ -474,6 +725,42 @@ function startHttp() {
       return;
     }
 
+    if (req.method === "GET" && (
+      url.pathname === "/.well-known/oauth-protected-resource" ||
+      url.pathname === "/.well-known/oauth-protected-resource/mcp"
+    )) {
+      sendJson(res, 200, protectedResourceMetadata(req));
+      return;
+    }
+
+    if (req.method === "GET" && (
+      url.pathname === "/.well-known/oauth-authorization-server" ||
+      url.pathname === "/.well-known/openid-configuration"
+    )) {
+      sendJson(res, 200, authorizationServerMetadata(req));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/register") {
+      await handleRegister(req, res);
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/authorize") {
+      handleAuthorizeGet(req, res, url);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/authorize") {
+      await handleAuthorizePost(req, res);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/token") {
+      await handleToken(req, res);
+      return;
+    }
+
     if (url.pathname !== "/mcp") {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "Not found. Use POST /mcp." }));
@@ -481,8 +768,7 @@ function startHttp() {
     }
 
     if (!isAuthorized(req)) {
-      res.writeHead(401, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized" }));
+      unauthorized(req, res);
       return;
     }
 
