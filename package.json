@@ -1,0 +1,19 @@
+{
+  "name": "trello-mcp-server",
+  "version": "1.0.0",
+  "description": "A dependency-free MCP server for Trello boards, lists, cards, comments, and labels.",
+  "type": "module",
+  "bin": {
+    "trello-mcp-server": "./src/server.js"
+  },
+  "scripts": {
+    "start": "node ./src/server.js",
+    "start:http": "MCP_TRANSPORT=http node ./src/server.js",
+    "check": "node --check ./src/server.js",
+    "inspect": "node ./scripts/inspect.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
