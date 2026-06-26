@@ -163,6 +163,31 @@ function authorizationServerMetadata(req) {
   };
 }
 
+function clientForAuthorization(clientId, redirectUri) {
+  const client = oauthClients.get(clientId);
+  if (client) {
+    return client.redirect_uris.includes(redirectUri) ? client : null;
+  }
+
+  try {
+    const parsed = new URL(redirectUri);
+    if (parsed.protocol !== "https:") return null;
+  } catch {
+    return null;
+  }
+
+  return {
+    client_id: clientId,
+    client_name: "ChatGPT",
+    redirect_uris: [redirectUri],
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "none",
+    scope: "trello",
+    recovered: true
+  };
+}
+
 const tools = [
   {
     name: "trello_whoami",
@@ -613,9 +638,10 @@ async function handleRegister(req, res) {
 }
 
 function handleAuthorizeGet(req, res, url) {
-  const client = oauthClients.get(url.searchParams.get("client_id"));
+  const clientId = url.searchParams.get("client_id");
   const redirectUri = url.searchParams.get("redirect_uri");
-  if (!client || !redirectUri || !client.redirect_uris.includes(redirectUri)) {
+  const client = clientForAuthorization(clientId, redirectUri);
+  if (!client) {
     sendJson(res, 400, { error: "invalid_client_or_redirect_uri" });
     return;
   }
@@ -663,8 +689,8 @@ async function handleAuthorizePost(req, res) {
     return;
   }
 
-  const client = oauthClients.get(form.client_id);
-  if (!client || !client.redirect_uris.includes(form.redirect_uri)) {
+  const client = clientForAuthorization(form.client_id, form.redirect_uri);
+  if (!client) {
     sendJson(res, 400, { error: "invalid_client_or_redirect_uri" });
     return;
   }
