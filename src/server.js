@@ -25,7 +25,6 @@ const boolProp = (description) => ({ type: "boolean", description });
 const numberProp = (description) => ({ type: "number", description });
 const oauthClients = new Map();
 const oauthCodes = new Map();
-const oauthTokens = new Map();
 
 function loadDotEnv() {
   if (!fs.existsSync(".env")) return;
@@ -45,6 +44,56 @@ loadDotEnv();
 
 function randomToken(prefix) {
   return `${prefix}_${crypto.randomBytes(24).toString("base64url")}`;
+}
+
+function oauthSigningSecret() {
+  const secret = process.env.MCP_OAUTH_SIGNING_SECRET ?? process.env.MCP_BEARER_TOKEN;
+  if (!secret) {
+    throw new Error("Missing MCP_BEARER_TOKEN or MCP_OAUTH_SIGNING_SECRET for OAuth token signing.");
+  }
+  return secret;
+}
+
+function signToken(type, payload, ttlSeconds) {
+  const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const body = Buffer.from(JSON.stringify({ ...payload, typ: type, exp: expiresAt }), "utf8").toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", oauthSigningSecret())
+    .update(body)
+    .digest("base64url");
+  return `${type}.${body}.${signature}`;
+}
+
+function verifyToken(token, type) {
+  const [tokenType, body, signature] = String(token ?? "").split(".");
+  if (tokenType !== type || !body || !signature) return null;
+
+  const expected = crypto
+    .createHmac("sha256", oauthSigningSecret())
+    .update(body)
+    .digest("base64url");
+  if (signature.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null;
+
+  try {
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    if (payload.typ !== type || payload.exp <= Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function validConnectCodes() {
+  return [process.env.MCP_CONNECT_CODE, process.env.MCP_BEARER_TOKEN]
+    .filter(Boolean)
+    .map((value) => String(value).trim());
+}
+
+function connectCodeIsValid(value) {
+  const submitted = String(value ?? "").trim();
+  const valid = validConnectCodes();
+  return valid.length === 0 || valid.includes(submitted);
 }
 
 function baseUrl(req) {
@@ -534,8 +583,7 @@ function isAuthorized(req) {
   if (!auth?.startsWith("Bearer ")) return !expected;
   const token = auth.slice("Bearer ".length);
   if (expected && token === expected) return true;
-  const issued = oauthTokens.get(token);
-  return Boolean(issued && issued.expires_at > Date.now());
+  return Boolean(verifyToken(token, "mcp"));
 }
 
 function unauthorized(req, res) {
@@ -598,7 +646,7 @@ function handleAuthorizeGet(req, res, url) {
       <label for="connect_code">Connect code</label>
       <input id="connect_code" name="connect_code" type="password" autocomplete="one-time-code" autofocus required>
       <button type="submit">Authorize</button>
-      <small>Use your Railway MCP_BEARER_TOKEN, unless MCP_CONNECT_CODE is set.</small>
+      <small>Use your Railway MCP_CONNECT_CODE. MCP_BEARER_TOKEN also works.</small>
     </form>
   </main>
 </body>
@@ -610,8 +658,7 @@ function handleAuthorizeGet(req, res, url) {
 
 async function handleAuthorizePost(req, res) {
   const form = await parseFormBody(req);
-  const expectedCode = process.env.MCP_CONNECT_CODE ?? process.env.MCP_BEARER_TOKEN;
-  if (expectedCode && form.connect_code !== expectedCode) {
+  if (!connectCodeIsValid(form.connect_code)) {
     sendJson(res, 403, { error: "invalid_connect_code" });
     return;
   }
@@ -660,48 +707,37 @@ async function handleToken(req, res) {
       return;
     }
 
-    const accessToken = randomToken("mcp");
-    const refreshToken = randomToken("refresh");
-    oauthTokens.set(accessToken, {
+    const tokenPayload = {
       client_id: form.client_id,
       scope: code.scope,
-      resource: form.resource ?? code.resource,
-      expires_at: Date.now() + 60 * 60 * 1000
-    });
-    oauthTokens.set(refreshToken, {
-      client_id: form.client_id,
-      scope: code.scope,
-      resource: form.resource ?? code.resource,
-      expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000,
-      refresh: true
-    });
+      resource: form.resource ?? code.resource
+    };
 
     sendJson(res, 200, {
-      access_token: accessToken,
+      access_token: signToken("mcp", tokenPayload, 60 * 60),
       token_type: "Bearer",
       expires_in: 3600,
-      refresh_token: refreshToken,
+      refresh_token: signToken("refresh", tokenPayload, 30 * 24 * 60 * 60),
       scope: code.scope
     }, { "cache-control": "no-store" });
     return;
   }
 
   if (form.grant_type === "refresh_token") {
-    const refresh = oauthTokens.get(form.refresh_token);
-    if (!refresh?.refresh || refresh.expires_at <= Date.now()) {
+    const refresh = verifyToken(form.refresh_token, "refresh");
+    if (!refresh) {
       sendJson(res, 400, { error: "invalid_grant" });
       return;
     }
 
-    const accessToken = randomToken("mcp");
-    oauthTokens.set(accessToken, {
+    const tokenPayload = {
       client_id: refresh.client_id,
       scope: refresh.scope,
-      resource: form.resource ?? refresh.resource,
-      expires_at: Date.now() + 60 * 60 * 1000
-    });
+      resource: form.resource ?? refresh.resource
+    };
+
     sendJson(res, 200, {
-      access_token: accessToken,
+      access_token: signToken("mcp", tokenPayload, 60 * 60),
       token_type: "Bearer",
       expires_in: 3600,
       scope: refresh.scope
