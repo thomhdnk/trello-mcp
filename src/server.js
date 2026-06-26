@@ -119,19 +119,9 @@ function sendMcpResponse(req, res, payload) {
     return;
   }
 
-  if (String(req.headers.accept ?? "").includes("text/event-stream")) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-      "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
-    });
-    res.end(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
-    return;
-  }
-
   res.writeHead(200, {
     "content-type": "application/json",
+    "cache-control": "no-store",
     "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
   });
   res.end(JSON.stringify(payload));
@@ -362,13 +352,33 @@ async function trello(path, { method = "GET", query = {}, body } = {}) {
     url.searchParams.set(name, String(value));
   }
 
-  const response = await fetch(url, {
-    method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(cleanObject(body)) : undefined
-  });
+  let response;
+  let payloadText = "";
+  const attempts = method === "GET" ? 2 : 1;
 
-  const payloadText = await response.text();
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    try {
+      response = await fetch(url, {
+        method,
+        headers: body ? { "content-type": "application/json" } : undefined,
+        body: body ? JSON.stringify(cleanObject(body)) : undefined,
+        signal: controller.signal
+      });
+      payloadText = await response.text();
+      if (response.ok || ![429, 500, 502, 503, 504].includes(response.status) || attempt === attempts) break;
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+    } catch (error) {
+      if (attempt === attempts) {
+        throw new Error(`Trello API request failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   let payload;
   try {
     payload = payloadText ? JSON.parse(payloadText) : {};
@@ -376,9 +386,10 @@ async function trello(path, { method = "GET", query = {}, body } = {}) {
     payload = payloadText;
   }
 
-  if (!response.ok) {
+  if (!response?.ok) {
+    const status = response?.status ?? "unknown";
     const detail = typeof payload === "string" ? payload : JSON.stringify(payload);
-    throw new Error(`Trello API ${response.status}: ${detail}`);
+    throw new Error(`Trello API ${status}: ${detail}`);
   }
 
   return payload;
@@ -423,7 +434,8 @@ async function callTool(name, args = {}) {
         query: {
           idBoard: args.boardId,
           name: args.name,
-          pos: args.position ?? "bottom"
+          pos: args.position ?? "bottom",
+          fields: "id,name,closed,pos,idBoard"
         }
       }));
 
@@ -465,7 +477,8 @@ async function callTool(name, args = {}) {
           desc: args.description,
           due: args.due,
           pos: args.position ?? "bottom",
-          idLabels: args.labels
+          idLabels: args.labels,
+          fields: "id,name,desc,url,shortUrl,closed,due,idBoard,idList,idLabels"
         }
       }));
 
@@ -477,7 +490,8 @@ async function callTool(name, args = {}) {
           desc: args.description,
           due: args.due,
           closed: args.closed,
-          subscribed: args.subscribed
+          subscribed: args.subscribed,
+          fields: "id,name,desc,url,shortUrl,closed,due,idBoard,idList,idLabels"
         }
       }));
 
@@ -486,14 +500,18 @@ async function callTool(name, args = {}) {
         method: "PUT",
         query: {
           idList: args.listId,
-          pos: args.position ?? "bottom"
+          pos: args.position ?? "bottom",
+          fields: "id,name,url,shortUrl,closed,due,idBoard,idList"
         }
       }));
 
     case "trello_archive_card":
       return text(await trello(`/cards/${encodeURIComponent(args.cardId)}`, {
         method: "PUT",
-        query: { closed: args.archived ?? true }
+        query: {
+          closed: args.archived ?? true,
+          fields: "id,name,url,shortUrl,closed,idBoard,idList"
+        }
       }));
 
     case "trello_add_comment":
@@ -510,7 +528,10 @@ async function callTool(name, args = {}) {
     case "trello_add_label_to_card":
       return text(await trello(`/cards/${encodeURIComponent(args.cardId)}/idLabels`, {
         method: "POST",
-        query: { value: args.labelId }
+        query: {
+          value: args.labelId,
+          fields: "id,name,url,shortUrl,idLabels"
+        }
       }));
 
     default:
@@ -813,116 +834,144 @@ function startHttp() {
   const defaultHost = process.env.RAILWAY_ENVIRONMENT ? "0.0.0.0" : "127.0.0.1";
   const host = process.env.HOST ?? defaultHost;
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(204, {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-        "access-control-allow-headers": "authorization,content-type,mcp-session-id",
-        "access-control-expose-headers": "mcp-session-id,www-authenticate"
-      });
-      res.end();
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/health") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ ok: true, name: SERVER_NAME, version: SERVER_VERSION }));
-      return;
-    }
-
-    if (req.method === "GET" && (
-      url.pathname === "/.well-known/oauth-protected-resource" ||
-      url.pathname === "/.well-known/oauth-protected-resource/mcp"
-    )) {
-      sendJson(res, 200, protectedResourceMetadata(req));
-      return;
-    }
-
-    if (req.method === "GET" && (
-      url.pathname === "/.well-known/oauth-authorization-server" ||
-      url.pathname === "/.well-known/openid-configuration"
-    )) {
-      sendJson(res, 200, authorizationServerMetadata(req));
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/register") {
-      await handleRegister(req, res);
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/authorize") {
-      handleAuthorizeGet(req, res, url);
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/authorize") {
-      await handleAuthorizePost(req, res);
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/token") {
-      await handleToken(req, res);
-      return;
-    }
-
-    if (url.pathname !== "/mcp") {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "Not found. Use POST /mcp." }));
-      return;
-    }
-
-    if (!isAuthorized(req)) {
-      unauthorized(req, res);
-      return;
-    }
-
-    if (req.method === "GET") {
-      res.writeHead(200, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache, no-transform",
-        connection: "keep-alive",
-        "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
-      });
-      res.write(": connected\n\n");
-      return;
-    }
-
-    if (req.method === "DELETE") {
-      res.writeHead(202);
-      res.end();
-      return;
-    }
-
-    if (req.method !== "POST") {
-      res.writeHead(405, { "allow": "GET,POST,DELETE", "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "Method not allowed. Use GET, POST, or DELETE /mcp." }));
-      return;
-    }
-
     try {
-      const payload = await parseJsonBody(req);
-      const messages = Array.isArray(payload) ? payload : [payload];
-      const responses = (await Promise.all(messages.map(handleRequest))).filter(Boolean);
-      sendMcpResponse(req, res, Array.isArray(payload) ? responses : responses[0] ?? null);
+      await handleHttpRequest(req, res);
     } catch (error) {
-      res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({
-        jsonrpc: "2.0",
-        id: null,
-        error: {
-          code: -32700,
-          message: error instanceof Error ? error.message : String(error)
-        }
-      }));
+      console.error("Unhandled HTTP error", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+      }
+      res.end(JSON.stringify({ error: "internal_server_error" }));
     }
   });
 
   server.listen(port, host, () => {
     console.error(`${SERVER_NAME} listening on http://${host}:${port}/mcp`);
   });
+}
+
+async function handleHttpRequest(req, res) {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+      "access-control-allow-headers": "authorization,content-type,mcp-session-id",
+      "access-control-expose-headers": "mcp-session-id,www-authenticate"
+    });
+    res.end();
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, name: SERVER_NAME, version: SERVER_VERSION }));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/debug") {
+    sendJson(res, 200, {
+      ok: true,
+      name: SERVER_NAME,
+      version: SERVER_VERSION,
+      transport: process.env.MCP_TRANSPORT ?? "stdio",
+      trelloConfigured: Boolean(process.env.TRELLO_API_KEY && process.env.TRELLO_TOKEN),
+      authConfigured: Boolean(process.env.MCP_BEARER_TOKEN || process.env.MCP_CONNECT_CODE)
+    });
+    return;
+  }
+
+  if (req.method === "GET" && (
+    url.pathname === "/.well-known/oauth-protected-resource" ||
+    url.pathname === "/.well-known/oauth-protected-resource/mcp"
+  )) {
+    sendJson(res, 200, protectedResourceMetadata(req));
+    return;
+  }
+
+  if (req.method === "GET" && (
+    url.pathname === "/.well-known/oauth-authorization-server" ||
+    url.pathname === "/.well-known/openid-configuration"
+  )) {
+    sendJson(res, 200, authorizationServerMetadata(req));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/register") {
+    await handleRegister(req, res);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/authorize") {
+    handleAuthorizeGet(req, res, url);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/authorize") {
+    await handleAuthorizePost(req, res);
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/token") {
+    await handleToken(req, res);
+    return;
+  }
+
+  if (url.pathname !== "/mcp") {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found. Use POST /mcp." }));
+    return;
+  }
+
+  if (!isAuthorized(req)) {
+    unauthorized(req, res);
+    return;
+  }
+
+  if (req.method === "GET") {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
+    });
+    res.write(": connected\n\n");
+    const heartbeat = setInterval(() => {
+      res.write(": keepalive\n\n");
+    }, 15000);
+    req.on("close", () => clearInterval(heartbeat));
+    return;
+  }
+
+  if (req.method === "DELETE") {
+    res.writeHead(202);
+    res.end();
+    return;
+  }
+
+  if (req.method !== "POST") {
+    res.writeHead(405, { "allow": "GET,POST,DELETE", "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "Method not allowed. Use GET, POST, or DELETE /mcp." }));
+    return;
+  }
+
+  try {
+    const payload = await parseJsonBody(req);
+    const messages = Array.isArray(payload) ? payload : [payload];
+    const responses = (await Promise.all(messages.map(handleRequest))).filter(Boolean);
+    sendMcpResponse(req, res, Array.isArray(payload) ? responses : responses[0] ?? null);
+  } catch (error) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32700,
+        message: error instanceof Error ? error.message : String(error)
+      }
+    }));
+  }
 }
 
 if (process.env.MCP_TRANSPORT === "http") {
