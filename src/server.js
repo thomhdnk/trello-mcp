@@ -13,6 +13,11 @@ const text = (value) => ({
   content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }]
 });
 
+const toolError = (error) => ({
+  isError: true,
+  content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }]
+});
+
 const jsonSchema = (properties, required = []) => ({
   type: "object",
   properties,
@@ -104,6 +109,31 @@ function baseUrl(req) {
 
 function sendJson(res, status, payload, headers = {}) {
   res.writeHead(status, { "content-type": "application/json", ...headers });
+  res.end(JSON.stringify(payload));
+}
+
+function sendMcpResponse(req, res, payload) {
+  if (payload === undefined || payload === null) {
+    res.writeHead(202);
+    res.end();
+    return;
+  }
+
+  if (String(req.headers.accept ?? "").includes("text/event-stream")) {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
+      "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
+    });
+    res.end(`event: message\ndata: ${JSON.stringify(payload)}\n\n`);
+    return;
+  }
+
+  res.writeHead(200, {
+    "content-type": "application/json",
+    "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
+  });
   res.end(JSON.stringify(payload));
 }
 
@@ -516,7 +546,11 @@ async function handleRequest(message) {
         result = { tools };
         break;
       case "tools/call":
-        result = await callTool(params?.name, params?.arguments ?? {});
+        try {
+          result = await callTool(params?.name, params?.arguments ?? {});
+        } catch (error) {
+          result = toolError(error);
+        }
         break;
       case "resources/list":
         result = { resources: [] };
@@ -781,6 +815,17 @@ function startHttp() {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+        "access-control-allow-headers": "authorization,content-type,mcp-session-id",
+        "access-control-expose-headers": "mcp-session-id,www-authenticate"
+      });
+      res.end();
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, name: SERVER_NAME, version: SERVER_VERSION }));
@@ -834,9 +879,26 @@ function startHttp() {
       return;
     }
 
+    if (req.method === "GET") {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
+      });
+      res.write(": connected\n\n");
+      return;
+    }
+
+    if (req.method === "DELETE") {
+      res.writeHead(202);
+      res.end();
+      return;
+    }
+
     if (req.method !== "POST") {
-      res.writeHead(405, { "allow": "POST", "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "Method not allowed. Use POST /mcp." }));
+      res.writeHead(405, { "allow": "GET,POST,DELETE", "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Method not allowed. Use GET, POST, or DELETE /mcp." }));
       return;
     }
 
@@ -844,11 +906,7 @@ function startHttp() {
       const payload = await parseJsonBody(req);
       const messages = Array.isArray(payload) ? payload : [payload];
       const responses = (await Promise.all(messages.map(handleRequest))).filter(Boolean);
-      res.writeHead(200, {
-        "content-type": "application/json",
-        "mcp-session-id": req.headers["mcp-session-id"] ?? "trello-mcp"
-      });
-      res.end(JSON.stringify(Array.isArray(payload) ? responses : responses[0] ?? null));
+      sendMcpResponse(req, res, Array.isArray(payload) ? responses : responses[0] ?? null);
     } catch (error) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({
