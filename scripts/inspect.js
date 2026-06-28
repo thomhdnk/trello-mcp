@@ -27,7 +27,7 @@ function parseFrames(onMessage) {
   };
 }
 
-const child = spawn(process.execPath, ["./src/server.js"], {
+const child = spawn(process.execPath, ["./src/hdnk-operations-server.js"], {
   stdio: ["pipe", "pipe", "inherit"],
   env: {
     ...process.env,
