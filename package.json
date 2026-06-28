@@ -1,15 +1,18 @@
 {
   "name": "trello-mcp-server",
-  "version": "1.0.0",
-  "description": "A dependency-free MCP server for Trello boards, lists, cards, comments, and labels.",
+  "version": "1.1.0",
+  "description": "HDNK Operations Agent on top of a dependency-free Trello MCP server.",
   "type": "module",
   "bin": {
-    "trello-mcp-server": "./src/server.js"
+    "trello-mcp-server": "./src/server.js",
+    "hdnk-operations-agent": "./src/hdnk-operations-server.js"
   },
   "scripts": {
-    "start": "node ./src/server.js",
-    "start:http": "MCP_TRANSPORT=http node ./src/server.js",
-    "check": "node --check ./src/server.js",
+    "start": "node ./src/hdnk-operations-server.js",
+    "start:trello": "node ./src/server.js",
+    "start:http": "MCP_TRANSPORT=http node ./src/hdnk-operations-server.js",
+    "start:trello:http": "MCP_TRANSPORT=http node ./src/server.js",
+    "check": "node --check ./src/server.js && node --check ./src/hdnk-operations-server.js",
     "inspect": "node ./scripts/inspect.js"
   },
   "engines": {
