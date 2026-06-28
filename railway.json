@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "MCP_TRANSPORT=http node ./src/server.js",
+    "startCommand": "MCP_TRANSPORT=http node ./src/hdnk-operations-server.js",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",
